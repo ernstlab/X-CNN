@@ -94,20 +94,26 @@ def scale(idxs, multiplier):
 	return out_idxs
 
 
-def AUC(pts, rule='trap'):
+def get_idxs(final_model, chrom_idxs):
+	# Returns indexes for train, validation, and test sets
+	[train_idxs, val_idxs, test_idxs] = [[]] * 3
+	if final_model:
+		train_idxs = list(np.concatenate([chrom_idxs[k] for k in \
+			['chr'+str(l) for l in list(range(1,8)) + list(range(10,23))]]).astype(int))
+		val_idxs = list(np.concatenate([chrom_idxs['chr8'], chrom_idxs['chr9']]).astype(int))
+	else:
+		train_idxs = list(np.concatenate([chrom_idxs[k] for k in \
+			['chr'+str(l) for l in list(range(2,8)) + list(range(10,23))]]).astype(int))
+		val_idxs = list(np.concatenate([chrom_idxs['chr8'], chrom_idxs['chr9']]).astype(int))
+		test_idxs = chrom_idxs['chr1']
+	return [train_idxs, val_idxs, test_idxs]
+
+
+def AUC(pts):
 	AUC_sum = 0
-	if rule == 'trap':
-		### This uses the trapezoidal rule
-		for pos in range(len(pts[0]) - 1):
-			AUC_sum += (pts[0,pos+1] - [pts[0,pos]]) * ((pts[1,pos+1] + [pts[1,pos]])/2)
-	elif rule == 'right':
-		### This uses the right hand approximation
-		for pos in range(len(pts[0]) - 1):
-			AUC_sum += (pts[0,pos+1] - [pts[0,pos]]) * pts[1,pos+1]
-	elif rule == 'left':
-		### This uses the right hand approximation
-		for pos in range(len(pts[0]) - 1):
-			AUC_sum += (pts[0,pos+1] - [pts[0,pos]]) * pts[1,pos]
+	### This uses the trapezoidal rule
+	for pos in range(len(pts[0]) - 1):
+		AUC_sum += (pts[0,pos+1] - [pts[0,pos]]) * ((pts[1,pos+1] + [pts[1,pos]])/2)
 	return AUC_sum
 
 
@@ -136,10 +142,10 @@ def generate_ROC(pos_stats, neg_stats):
 		pts.append((neg_idx/total_neg, pos_idx/total_pos))
 	pts.append((1.,1.))
 	pts = np.transpose(np.array(pts))
-	return pts, AUC(pts, 'trap')
+	return pts, AUC(pts)
 
 
-def generate_PR(pos_stats,neg_stats):
+def generate_PR(pos_stats, neg_stats):
 	### pos_stats and neg_stats are both sorted from largest to smallest
 	if not all([pos_stats[i] >= pos_stats[i+1] for i in range(len(pos_stats)-1)]):
 		pos_stats = sorted(pos_stats, reverse=True)
@@ -148,23 +154,30 @@ def generate_PR(pos_stats,neg_stats):
 	total_pos = float(len(pos_stats))
 	total_neg = float(len(neg_stats))
 	pts = [(0,0)]
-	pos_idx=0
-	neg_idx=0
-	while pos_idx < total_pos and neg_idx < total_neg:
-		if pos_stats[pos_idx] > neg_stats[neg_idx]:
-			pos_idx += 1
-		elif pos_stats[pos_idx] < neg_stats[neg_idx]:
-			neg_idx += 1
+
+	# Collapspe positive statistics to resolve any ties
+	pos_stats_sorted = sorted(list(set(np.array(pos_stats).flatten())), reverse=True)
+	for pos_stat in pos_stats_sorted:
+		TP = np.sum(pos_stats >= pos_stat)
+		FP = np.sum(neg_stats >= pos_stat)
+		if np.sum(pos_stats == pos_stat) > 1:
+			# Follow Davis & Goadrich (2006) to interpolate points
+			prev_TP = np.sum(pos_stats > pos_stat)
+			prev_FP = np.sum(neg_stats > pos_stat)
+			skew = (FP - prev_FP) / (TP - prev_TP)
+			for x in range(1, TP - prev_TP+1):
+				recall = (prev_TP + x) / total_pos
+				precision = (prev_TP + x) / (prev_TP + x + prev_FP + (skew*x)) 
+				pts.append((recall, precision))
 		else:
-			tied_value = pos_stats[pos_idx]
-			while pos_idx < total_pos and pos_stats[pos_idx] == tied_value:
-				pos_idx += 1
-			while neg_idx < total_neg and neg_stats[neg_idx] == tied_value:
-				neg_idx += 1
-		pts.append((pos_idx/total_pos, pos_idx/float(pos_idx + neg_idx)))
+			# Calculate precision and recall directly
+			recall = TP / total_pos
+			precision = TP / (TP + FP)
+			pts.append((recall, precision))
+		
 	pts.append((1., total_pos/(total_pos+total_neg)))
 	pts = np.transpose(np.array(pts))
-	return pts, AUC(pts, 'trap')
+	return pts, AUC(pts)
 
 
 def flip(input_array, neg_motif=False):
@@ -178,123 +191,169 @@ def flip(input_array, neg_motif=False):
 	return input_array[:, ::-1]
 
 
-def generate_samples(args, input_length, data_pos, pos_idxs, data_neg=None,
-		ret_pos=True, ret_single=False, ret_neg_shuffle=False, side='both'):
+def generate_negative_samples(args, interactions, interaction_length, pos_chrom_list, positions):
+	# Generate negative samples with a specified ratio to the number of positive samples
+	# Record distance between regions
+	input_length = interaction_length // args.data_res
+	distance_distr = []
+	for idx, row in interactions.iterrows():
+		distance_distr.append(row[4] - row[1])
+		start_pos=(row[1]+row[2])//2 - interaction_length//2
+		end_pos=(row[1]+row[2])//2 + interaction_length//2
+	distance_distr = np.array(distance_distr)
+	# Set up instance of database object
+	hdfile = h5py.File(args.database, 'r')
+	grp = hdfile['/'+args.cell_type+'/50']
+	dset = grp[u'chip_tracks']
+	curr_db = chip_data(hdfile, grp, dset, args.cell_type, args.tracks)
+	data_neg = []
+	outfile = open(args.out_dir + args.cell_type+'.interactions.neg.txt', 'w')
+	num_interactions = len(interactions)
+	neg_chrom_list = []
+	# Take distribution of peak distances and draw random positions genome-wide
+	for idx in range(len(interactions)):
+		# Sample negative interactions to make a neg_ratio ratio
+		while len(data_neg) <= args.neg_ratio * idx:
+			# Choose distance first to guarantee following distribution
+			while True:
+				distance = np.random.choice(distance_distr)//args.data_res
+				chromosome = pos_chrom_list[idx]
+				distance = np.random.choice(distance_distr)//args.data_res
+				try:
+					start_left = np.random.choice(len(positions[chromosome]) \
+												  - distance - input_length)
+					break
+				except ValueError:
+					pass
+			neg_chrom_list.append(chromosome)
+			start_right = start_left + distance
+			# Add to data
+			data_neg.append( \
+					[get_data(args, curr_db, chromosome, start_left*args.data_res, \
+						(start_left+(interaction_length//args.data_res))*args.data_res),
+					get_data(args, curr_db, chromosome, start_right*args.data_res, \
+						(start_right+(interaction_length//args.data_res))*args.data_res)])
+				# Write interaction out to file
+			outfile.write('\t'.join([str(k) for k in \
+				[chromosome, start_left*args.data_res, 
+				(start_left+input_length)*args.data_res,
+				chromosome, start_right*args.data_res, 
+				(start_right+input_length)*args.data_res]]) + '\n')
+			sys.stdout.write("\r{:5.1f}".format(float(idx) / (num_interactions) \
+					* 100) + "% complete.")
+	sys.stdout.write('\r100.0% complete!\n')
+	outfile.close()
+	data_neg = np.array(data_neg)
+	for i in np.argwhere(np.isnan(data_neg)):
+		data_neg[tuple(i)] = 0.
+	# data array is of shape (num_samples, 2, num_tracks, input_length)
+	fname = ':'.join([args.out_dir + args.cell_type, args.tracks, args.transform, str(args.data_res)+'bp', 
+					  'neg.npy'])
+	np.save(fname, data_neg)
+	if args.low_mem:
+		del data_neg
+		data_neg = np.load(fname, mmap_mode='r')
+
+	return data_neg, neg_chrom_list
+
+
+def add_sample(left_array, right_array, data_left, data_right):
+	left_array.append(data_left)
+	right_array.append(data_right)
+	left_array.append(data_right)
+	right_array.append(data_left)
+	return left_array, right_array
+
+
+def generate_samples(args, input_length, data_pos=None, pos_idxs=None, data_neg=None, neg_idxs=None,
+		ret_single=False, ret_neg_shuffle=False, side='both'):
 	# This function takes in a list of data matrices, iterates over them and generates positve 
 	# and negative samples by flipping and shuffling
-
+	#
 	# At each iteration, return a positive sample and its mirror
 	# Also return negative samples and their mirrors
-
-	# This should be an integer. Tell us how many lines to process for the negative file as 
-	# compared to the positive
-	num_tracks = np.shape(data_pos)[2]
-	num_pos = len(pos_idxs)
-	# Offset the shuffle so it's not just the previous interaction, but any
-	shuffle_offset = 0
 	while True:
-		# will loop over all indexes
-		shuffle_offset += 1
-
 		# Reset label and weight vectors
 		label_vect = []
 		weight_vect = []
-
+		#
 		# Need to return array of samples
 		left_output_array = []
 		right_output_array = []
 		# Go over every index in the fold
-		np.random.shuffle(pos_idxs)
+		neg_list_idx = 0
 		for list_idx, data_idx in enumerate(pos_idxs):
-			# Pull out interaction data
-			data_left = data_pos[data_idx, 0]
-			data_right = flip(data_pos[data_idx, 1])
 
-			if ret_single:
-				# Need to reshape to have length 1 (1 sample)
-				output_shape = (1, input_length, num_tracks)
-				if side == 'left' or side == 'both':
-					yield (np.reshape([np.swapaxes(data_left, 1, 0)], output_shape),
-							np.reshape([np.swapaxes(data_left, 1, 0)], output_shape))
-				if side == 'right' or side == 'both':
-					yield (np.reshape([np.swapaxes(data_right, 1, 0)], output_shape),
-							np.reshape([np.swapaxes(data_right, 1, 0)], output_shape))
-				continue
-
-			# yield data, label, weight
-			# we will weight positive more than negative, so their total weights are equal
-			# only time this doesn't happen is when we return only negative samples for test set
-			if ret_pos:
-				left_output_array.append(data_left)
-				right_output_array.append(data_right)
-				label_vect.append(1)
-				weight_vect.append(2)
-				if args.shared_weights:
-					left_output_array.append(data_right)
-					right_output_array.append(data_left)
-					label_vect.append(1)
-					weight_vect.append(2)
+			if hasattr(data_pos, 'shape'):
+				# Pull out interaction data
+				data_left = data_pos[data_idx, 0]
+				data_right = flip(data_pos[data_idx, 1])
+				if ret_single:
+					# Need to reshape to have length 1 (1 sample)
+					output_shape = (1, input_length, np.shape(data_pos)[2])
+					# yield data, label, weight, move to next sample
+					if side == 'left' or side == 'both':
+						yield (np.reshape([np.swapaxes(data_left, 1, 0)], output_shape),
+								np.reshape([np.swapaxes(data_left, 1, 0)], output_shape))
+					if side == 'right' or side == 'both':
+						yield (np.reshape([np.swapaxes(data_right, 1, 0)], output_shape),
+								np.reshape([np.swapaxes(data_right, 1, 0)], output_shape))
+					continue
+				else:
+					left_output_array, right_output_array = add_sample(left_output_array, right_output_array,
+																	   data_left, data_right)
+					label_vect.extend([1] * 2)
+					weight_vect.extend([1] * 2)
 
 			# Negative samples are generated by shifting positive samples, 
 			# using the given negative, and all their mirror images
 			# Take the previous positive line as the "shuffled" interaction
 			if ret_neg_shuffle:
-				prev_data_left = data_pos[pos_idxs[(list_idx+shuffle_offset)%num_pos], 0]
-				prev_data_right = flip(data_pos[pos_idxs[(list_idx+shuffle_offset)%num_pos], 1])
-
-				left_output_array.append(data_left)
-				right_output_array.append(prev_data_right)
-				left_output_array.append(prev_data_left)
-				right_output_array.append(data_right)
-				label_vect.extend([0] * 2)
-				weight_vect.extend([1] * 2)
-
-				if args.shared_weights:
-					left_output_array.append(prev_data_right)
-					right_output_array.append(data_left)
-					left_output_array.append(data_right)
-					right_output_array.append(prev_data_left)
-
-					label_vect.extend([0] * 2)
-					weight_vect.extend([1] * 2)
+				prev_data_left = data_pos[data_idx-1, 0]
+				prev_data_right = flip(data_pos[data_idx-1, 1])
+				left_output_array, right_output_array = add_sample(left_output_array, right_output_array, 
+																   data_left, prev_data_right)
+				left_output_array, right_output_array = add_sample(left_output_array, right_output_array, 
+																   prev_data_left, data_right)
+				label_vect.extend([0] * 4)
+				weight_vect.extend([0.5] * 4)  # Weigh half as much because 2 ways to swap
 			# 
 			if hasattr(data_neg, 'shape'):
-				# multiplier tells us how much more negative data we have than positive
-				multiplier = int(np.shape(data_neg)[0] / np.shape(data_pos)[0])
-				for mult_idx in range(multiplier):
-					data_left_neg = data_neg[data_idx*multiplier + mult_idx, 0]
-					data_right_neg = flip(data_neg[data_idx*multiplier + mult_idx, 1])
-					left_output_array.append(data_left_neg)
-					right_output_array.append(data_right_neg)
-					if args.shared_weights:
-						left_output_array.append(data_right_neg)
-						right_output_array.append(data_left_neg)
-
-				label_vect.extend([0] * multiplier)
-				weight_vect.extend([1] * multiplier)
-				if args.shared_weights:
-					label_vect.extend([0] * multiplier)
-					weight_vect.extend([1] * multiplier)
+				# Add negative samples until proper balance is achieved
+				while neg_list_idx <= list_idx * args.neg_ratio:
+					data_left_neg = data_neg[neg_list_idx, 0]
+					data_right_neg = flip(data_neg[neg_list_idx, 1])
+					left_output_array, right_output_array = add_sample(left_output_array, right_output_array, 
+																	   data_left_neg, data_right_neg)
+					label_vect.extend([0] * 2)
+					weight_vect.extend([1./args.neg_ratio] * 2)
+					neg_list_idx += 1
+			#
 			# Yield entire matrix
 			if (list_idx+1) % args.batch_size == 0 or list_idx == len(pos_idxs)-1:
 				# pad matrices with zeros so all matrices are the same size
 				if args.pad:
-					left_output_array = pad( np.array(left_output_array), 
+					left_output_array = pad(np.array(left_output_array), 
 											axis=2, 
-											total_pad=2*args.filter_len )
-					right_output_array = pad( np.array(right_output_array), 
+											total_pad=2*args.filter_len)
+					right_output_array = pad(np.array(right_output_array), 
 											axis=2, 
-											total_pad=2*args.filter_len )
+											total_pad=2*args.filter_len)
 				yield ([np.swapaxes(left_output_array, 1, 2), \
 						np.swapaxes(right_output_array, 1, 2)], \
 						np.array(label_vect), \
 						np.array(weight_vect))
-
+				#
 				# Reset label and weight vectors, array of samples
 				left_output_array = []
 				right_output_array = []
 				label_vect = []
 				weight_vect = []
+
+		# After passing through all samples, shuffle indexes for next epoch
+		# This will not apply when doing validation
+		if pos_idxs: np.random.shuffle(pos_idxs)
+		if neg_idxs: np.random.shuffle(neg_idxs)
 
 
 def make_subnetwork(args, input_length, num_tracks, encoder=None):
@@ -429,14 +488,18 @@ def train_autoencoder(args, data_pos, pos_idxs, side='both'):
 	return encoder
 
 
-def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos_test_idxs=[], 
-		data_neg=None):
+def train_and_test_model(args, 
+		data_pos, pos_train_idxs=[], pos_val_idxs=[], pos_test_idxs=[], 
+		data_neg=None, neg_train_idxs=[], neg_val_idxs=[], neg_test_idxs=[]):
 
 	# Set length of input and number of training samples
 	num_samples, x, num_tracks, input_length = np.shape(data_pos)
 	interaction_length = input_length * args.data_res
+	if args.neg_shuffle:
+		data_neg = data_pos
+		[neg_train_idxs, neg_val_idxs, neg_test_idxs] = [pos_train_idxs, pos_val_idxs, pos_test_idxs]
 
-	# Train autoencoder on all samples (training, validation, and test) if called for
+	# Train autoencoder on all samples (training, validation, and test) and build model
 	encoder = None
 	if args.autoencoder:
 		if args.shared_weights:
@@ -444,6 +507,7 @@ def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos
 				data_pos=data_pos,
 				pos_idxs=pos_train_idxs,
 				side='both')
+			final_model = make_model(args, input_length, num_tracks, encoder_1=encoder)
 		else:
 			encoder_1 = train_autoencoder(args, 
 				data_pos=data_pos,
@@ -453,13 +517,7 @@ def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos
 				data_pos=data_pos,
 				pos_idxs=pos_train_idxs,
 				side='right')
-
-	# Create the model
-	if args.shared_weights:
-		final_model = make_model(args, input_length, num_tracks, encoder_1=encoder)
-	else:
-		final_model = make_model(args, input_length, num_tracks, 
-			encoder_1=encoder_1, encoder_2=encoder_2)
+			final_model = make_model(args, input_length, num_tracks, encoder_1=encoder_1, encoder_2=encoder_2)
 
 	# Use adadelta as an optimizer
 	final_model.compile(optimizer='adadelta', loss='binary_crossentropy')
@@ -469,25 +527,27 @@ def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos
 	modelCheckpoint = keras.callbacks.ModelCheckpoint(modelpath, save_best_only=True)
 	earlyStopping = keras.callbacks.EarlyStopping(patience=args.early_stop)
 	if args.test:
-		args.nb_epochs = 1
+		args.num_epochs = 1
 	# Fit model with a generator
 	sys.stdout.write("*** Training CNN ***\n")
 	final_model.fit_generator(
 		generate_samples(args,
 			data_pos=data_pos,
 			pos_idxs=pos_train_idxs,
+			data_neg=data_neg,
+			neg_idxs=neg_train_idxs,
 			input_length=input_length,
-			ret_neg_shuffle=args.neg_shuffle,
-			data_neg=data_neg),
+			ret_neg_shuffle=args.neg_shuffle,),
 		validation_data=generate_samples(args,
 			data_pos=data_pos,
 			pos_idxs=pos_val_idxs,
+			data_neg=data_neg,
+			neg_idxs=neg_val_idxs,
 			input_length=input_length,
-			ret_neg_shuffle=args.neg_shuffle,
-			data_neg=data_neg),
+			ret_neg_shuffle=args.neg_shuffle),
 		steps_per_epoch=roundup(len(pos_train_idxs) / args.batch_size),
 		validation_steps=roundup(len(pos_val_idxs) / args.batch_size),
-		epochs=args.nb_epochs,
+		epochs=args.num_epochs,
 		verbose=int(args.verbose),
 		callbacks=[earlyStopping, modelCheckpoint],
 		max_queue_size=96)
@@ -503,13 +563,11 @@ def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos
 		max_queue_size=96)
 	neg_prob_val = final_model.predict_generator(
 		generate_samples(args,
-			data_pos=data_pos,
-			pos_idxs=pos_val_idxs,
+			data_pos=data_neg,
+			pos_idxs=neg_val_idxs,
 			input_length=input_length, 
-			ret_neg_shuffle=args.neg_shuffle,
-			data_neg=data_neg,
-			ret_pos=False),
-		steps=roundup(len(pos_val_idxs) / args.batch_size),
+			ret_neg_shuffle=args.neg_shuffle),
+		steps=roundup(len(neg_val_idxs) / args.batch_size),
 		max_queue_size=96)
 
 	with open(args.out_dir+'pos_prob_val'+args.out_suff+'txt','w') as outfile:
@@ -540,13 +598,11 @@ def train_and_test_model(args, data_pos, pos_train_idxs=[], pos_val_idxs=[], pos
 			max_queue_size=96)
 		neg_prob_test = final_model.predict_generator(
 			generate_samples(args,
-				data_pos=data_pos,
-				pos_idxs=pos_test_idxs,
+				data_pos=data_neg,
+				pos_idxs=neg_test_idxs,
 				input_length=input_length, 
-				ret_neg_shuffle=args.neg_shuffle,
-				data_neg=data_neg,
-				ret_pos=False),
-			steps=roundup(len(pos_test_idxs) / args.batch_size),
+				ret_neg_shuffle=args.neg_shuffle),
+			steps=roundup(len(neg_test_idxs) / args.batch_size),
 			max_queue_size=96)
 		
 
@@ -572,11 +628,10 @@ def main():
 	parser.add_argument('data_res', help='resolution of input data (in bp)', type=int)
 	parser.add_argument('interaction', help='name of interaction file')
 	parser.add_argument('--pos_data', help='name of positive data file. Exclusive with --database', default=None)
-	parser.add_argument('--neg_shuffle', help='shuffle positive data for negative set', default='True')
-	parser.add_argument('--two_null', help='times to use two-null background per interaction', default=0, type=int)
-	parser.add_argument('--two_null_data', help='name of two-null data file', default=None)
-	parser.add_argument('--two_random', help='times to use two-random background per interaction', default=0, type=int)
-	parser.add_argument('--two_random_data', help='name of two-random data file', default=None)
+	parser.add_argument('--neg_shuffle', help='shuffle positive data for negative set', default=False, type=bool_parse)
+	parser.add_argument('--neg_ratio', help='number of negative samples to generate per positive sample', default=1., type=float)
+	parser.add_argument('--neg_data_file', help='name of negative data file', default=None)
+	parser.add_argument('--neg_intn_file', help='name of negative interaction file', default=None)
 	parser.add_argument('--database', help='name of database', default=None)
 	parser.add_argument('--transform', help='data transform [none, log, z, log_z]', default='log')
 	parser.add_argument('--low_mem', help='use low-memory mode to handle data', default=False, action='store_true')
@@ -593,7 +648,7 @@ def main():
 	parser.add_argument('--extra_dense', help='use extra dense layer in model', default=False, action='store_true')
 	parser.add_argument('--bias', help='include bias in learning of dense and logistic layer', default=True, type=bool_parse)
 	parser.add_argument('--regularizer', help='strength of regularizer', default=0.0001, type=float)
-	parser.add_argument('--nb_epochs', help='number of epochs to train', default=500, type=int)
+	parser.add_argument('--num_epochs', help='number of epochs to train', default=500, type=int)
 	parser.add_argument('--early_stop', help='number of epochs to wait once validation loss starts increasing', default=5)
 	parser.add_argument('--final', help='do not withhold data for testing and save final model', default=False, action='store_true')
 	parser.add_argument('--out_suff', help='additional suffix to use in naming files', default='.')
@@ -613,10 +668,6 @@ def main():
 		args.out_suff += '.'
 	if not os.path.exists(args.out_dir):
 		os.makedirs(args.out_dir)
-	if args.neg_shuffle.lower() in ['false', 'f', 'no']:
-		args.neg_shuffle = False
-	else:
-		args.neg_shuffle = True
 	# start timer
 	start_time = time.time()
 	seed = args.seed
@@ -628,7 +679,7 @@ def main():
 		toskip = 0
 		if str(infile.readline()).startswith('chr1\tx1\tx2'):
 			toskip = 1
-	interactions = pd.read_table(args.interaction, usecols=range(6), 
+	interactions = pd.read_csv(args.interaction, usecols=range(6), sep='\t', 
 		names=['chrA', 'startA','endA','chrB','startB','endB'], skiprows=toskip)
 	# If the chromosome name does not start with 'chr', add it in front
 	if interactions.iloc[0]['chrA'] == '1':
@@ -640,15 +691,9 @@ def main():
 	else:
 		interaction_length = interactions.iloc[0]['endA'] - interactions.iloc[0]['startA']
 	input_length = interaction_length // args.data_res
-	# Record distance between regions
-	distance_distr = []
-	for idx, row in interactions.iterrows():
-		distance_distr.append(row[4] - row[1])
-		start_pos=(row[1]+row[2])//2 - interaction_length//2
-		end_pos=(row[1]+row[2])//2 + interaction_length//2
-	distance_distr = np.array(distance_distr)
+
 	# Find positions of single interacting loci
-	if args.two_null or args.two_random:
+	if args.neg_ratio:
 		with open(args.chr_size, 'rU') as infile:
 			# initialize vectors
 			positions = {}
@@ -717,170 +762,44 @@ def main():
 			data_pos = np.load(args.out_dir + args.cell_type+':'+args.tracks+':'+\
 				args.transform+':'+str(args.data_res)+'bp.npy', mmap_mode='r')
 
-	if args.two_null_data:
-		sys.stderr.write('Reading negative data.\n')
-		if args.low_mem:
-			data_two_null = np.load(args.two_null_data, mmap_mode='r')
-		else:
-			data_two_null = np.load(args.two_null_data)
-		args.two_null = int(len(data_two_null) // len(data_pos))
-	# Check if two_null file already exists and would be overwritten
-	elif args.two_null and os.path.isfile(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-										  args.transform+':'+str(args.data_res)+'bp:two_null.npy'):
-		sys.stderr.write('Reading existing negative data.\n')
-		data_two_null = np.load(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-								args.transform+':'+str(args.data_res)+'bp:two_null.npy')
-	elif args.two_null:
-		sys.stdout.write("Generating two-null negative samples\n")
-		hdfile = h5py.File(args.database, 'r')
-		grp = hdfile['/'+args.cell_type+'/50']
-		dset = grp[u'chip_tracks']
-		# Set up instance of database object
-		curr_db = chip_data(hdfile, grp, dset, args.cell_type, args.tracks)
-		data_two_null = []
-		outfile = open(args.out_dir + args.cell_type+'.interactions.two_null.txt', 'w')
-		# Take distribution of peak distances and draw random positions genome-wide
-		for idx in range(len(interactions)):
-			for idx_ in range(args.two_null):
-				# Choose distance first to guarantee following distribution
-				distance = np.random.choice(distance_distr)//args.data_res
-				chromosome = pos_chrom_list[idx]
-				try_count = 0
-				while True:	
-					if try_count == 50:
-						distance = np.random.choice(distance_distr)//args.data_res
-						try_count = 0
-					if len(positions[chromosome]) < distance:
-						try_count += 1
-						continue
-					start_left = np.random.choice(len(positions[chromosome]) \
-							- distance - input_length)
-					start_right = start_left + distance
-					# If it does not overlap any interacting elements, add to data
-					if np.sum(positions[chromosome][start_left:start_left+input_length]) == 0 and \
-						np.sum(positions[chromosome][start_right:start_right+input_length]) == 0:
-						data_two_null.append( \
-								[get_data(args, curr_db, chromosome, start_left*args.data_res, \
-									(start_left+(interaction_length//args.data_res))*args.data_res),
-								get_data(args, curr_db, chromosome, start_right*args.data_res, \
-									(start_right+(interaction_length//args.data_res))*args.data_res)])
-							# Write interaction out to file
-						outfile.write('\t'.join([str(k) for k in \
-							[chromosome, start_left*args.data_res, 
-							(start_left+input_length)*args.data_res,
-							chromosome, start_right*args.data_res, 
-							(start_right+input_length)*args.data_res]]) + '\n')
-						break
-				sys.stdout.write("\r{:5.1f}".format(float(idx) / (num_interactions) \
-						* 100) + "% complete")
-		sys.stdout.write('\r100.0% complete!\n')
-		outfile.close()
-		data_two_null = np.array(data_two_null)
-		for i in np.argwhere(np.isnan(data_two_null)):
-			data_two_null[tuple(i)] = 0.
-		# data array is of shape (num_samples, 2, num_tracks, input_length)
-		np.save(args.out_dir + args.cell_type+':'+args.tracks+':'+args.transform+':'+\
-				str(args.data_res)+'bp:two_null.npy', data_two_null)
-		if args.low_mem:
-			del data_two_null
-			data_two_null = np.load(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-				args.transform+':'+str(args.data_res)+'bp:two_null.npy', mmap_mode='r')
-
-	if args.two_random_data:
-		sys.stderr.write('Reading negative data.\n')
-		if args.low_mem:
-			data_two_random = np.load(args.two_random_data, mmap_mode='r')
-		else:
-			data_two_random = np.load(args.two_random_data)
-		args.two_random = int(len(data_two_random) // len(data_pos))
-	# Check if two_null file already exists and would be overwritten
-	elif args.two_random and os.path.isfile(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-										  args.transform+':'+str(args.data_res)+'bp:two_random.npy'):
-		sys.stderr.write('Reading existing negative data.\n')
-		data_two_random = np.load(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-								  args.transform+':'+str(args.data_res)+'bp:two_random.npy')
-	elif args.two_random:
-		sys.stdout.write("Generating two-random negative samples.\n")
-		hdfile = h5py.File(args.database, 'r')
-		grp = hdfile['/'+args.cell_type+'/50']
-		dset = grp[u'chip_tracks']
-		# Set up instance of database object
-		curr_db = chip_data(hdfile, grp, dset, args.cell_type, args.tracks)
-		data_two_random = []
-		outfile = open(args.out_dir + args.cell_type+'.interactions.two_random.txt', 'w')
-		# Take distribution of peak distances and draw random positions genome-wide
-		for idx in range(len(interactions)):
-			for idx_ in range(args.two_random):
-				# Choose distance first to guarantee following distribution
-				while True:
-					distance = np.random.choice(distance_distr)//args.data_res
-					chromosome = pos_chrom_list[idx]
-					distance = np.random.choice(distance_distr)//args.data_res
-					try:
-						start_left = np.random.choice(len(positions[chromosome]) \
-													  - distance - input_length)
-						break
-					except ValueError:
-						pass
-				start_right = start_left + distance
-				# Add to data
-				data_two_random.append( \
-						[get_data(args, curr_db, chromosome, start_left*args.data_res, \
-							(start_left+(interaction_length//args.data_res))*args.data_res),
-						get_data(args, curr_db, chromosome, start_right*args.data_res, \
-							(start_right+(interaction_length//args.data_res))*args.data_res)])
-					# Write interaction out to file
-				outfile.write('\t'.join([str(k) for k in \
-					[chromosome, start_left*args.data_res, 
-					(start_left+input_length)*args.data_res,
-					chromosome, start_right*args.data_res, 
-					(start_right+input_length)*args.data_res]]) + '\n')
-				sys.stdout.write("\r{:5.1f}".format(float(idx) / (num_interactions) \
-						* 100) + "% complete.")
-		sys.stdout.write('\r100.0% complete!\n')
-		outfile.close()
-		data_two_random = np.array(data_two_random)
-		for i in np.argwhere(np.isnan(data_two_random)):
-			data_two_random[tuple(i)] = 0.
-		# data array is of shape (num_samples, 2, num_tracks, input_length)
-		np.save(args.out_dir + args.cell_type+':'+args.tracks+':'+args.transform+':'+\
-				str(args.data_res)+'bp:two_random.npy', data_two_random)
-		if args.low_mem:
-			del data_two_random
-			data_two_random = np.load(args.out_dir + args.cell_type+':'+args.tracks+':'+\
-				args.transform+':'+str(args.data_res)+'bp:two_random.npy', mmap_mode='r')
-
-	if args.two_null:
-		data_neg = data_two_null
-		args.neg_shuffle = False
-	elif args.two_random:
-		data_neg = data_two_random
-		args.neg_shuffle = False
-	else:
+	if args.neg_shuffle:
 		data_neg = None
-		data_two_null = None
 
-	[pos_train_idxs, pos_val_idxs, pos_test_idxs] = [[]] * 3
-	if args.final:
-		pos_train_idxs = list(np.concatenate([pos_chrom_idxs[k] for k in \
-			['chr'+str(l) for l in list(range(1,8)) + list(range(10,23))]]).astype(int))
-		pos_val_idxs = list(np.concatenate([pos_chrom_idxs['chr8'], 
-											pos_chrom_idxs['chr9']]).astype(int))
+	elif args.neg_data_file:
+		sys.stderr.write('Reading negative data.\n')
+		if args.low_mem:
+			data_neg = np.load(args.neg_data_file, mmap_mode='r')
+		else:
+			data_neg = np.load(args.neg_data_file)
+		args.neg_ratio = len(data_neg) / len(data_pos)
+		# Read in interactions to get chromosomes
+		neg_interactions = pd.read_csv(args.neg_intn_file, usecols=range(6), sep='\t', 
+			names=['chrA', 'startA','endA','chrB','startB','endB'])
+		neg_chrom_list = list(neg_interactions['chrA'])
+		neg_chrom_idxs = {'chr'+str(k):[] for k in list(range(1,23)) + ['X']}
+		for idx, chrom in enumerate(neg_chrom_list):
+			neg_chrom_idxs[chrom].append(idx)
+
 	else:
-		pos_train_idxs = list(np.concatenate([pos_chrom_idxs[k] for k in \
-			['chr'+str(l) for l in list(range(2,8)) + list(range(10,23))]]).astype(int))
-		pos_val_idxs = list(np.concatenate([pos_chrom_idxs['chr8'], 
-											pos_chrom_idxs['chr9']]).astype(int))
-		pos_test_idxs = pos_chrom_idxs['chr1']
+		sys.stdout.write("Generating negative samples.\n")
+		data_neg, neg_chrom_list = generate_negative_samples(args, interactions, interaction_length, 
+															 pos_chrom_list, positions)
 
-	# Generate corresponding indexes for negative data, if necessary
+		neg_chrom_idxs = {'chr'+str(k):[] for k in list(range(1,23)) + ['X']}
+		for idx, chrom in enumerate(neg_chrom_list):
+			neg_chrom_idxs[chrom].append(idx)
+
+	[pos_train_idxs, pos_val_idxs, pos_test_idxs] = get_idxs(args.final, pos_chrom_idxs)
+	[neg_train_idxs, neg_val_idxs, neg_test_idxs] = get_idxs(args.final, neg_chrom_idxs)
+
 	np.random.shuffle(pos_train_idxs)
 
 	# Train and test model
 	sys.stdout.write("Starting training.\n")
 	sys.stdout.flush()
 	train_and_test_model(args, data_pos, data_neg=data_neg, 
-			pos_train_idxs=pos_train_idxs, pos_val_idxs=pos_val_idxs, pos_test_idxs=pos_test_idxs)
+			pos_train_idxs=pos_train_idxs, pos_val_idxs=pos_val_idxs, pos_test_idxs=pos_test_idxs,
+			neg_train_idxs=neg_train_idxs, neg_val_idxs=neg_val_idxs, neg_test_idxs=neg_test_idxs)
 
 	sys.stdout.write('Finished in ')
 	sys.stdout.flush()

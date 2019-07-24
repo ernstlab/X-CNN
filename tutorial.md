@@ -77,7 +77,7 @@ python3 fine_map.py \
 --data GM12878:all:log:100bp.npy
 ```
 
-This outputs four files:
+This outputs five files:
 1. A binary gradient file `gradients.npy` of the same shape as the input data `(num_interactions, 2, num_tracks, length)`
 2. A binary importances file `importances.npy` of size `(num_interactions, 2, length)`
 3. A tab-delimited importance file `importances.left.txt` with `num interactions` rows and `length` columns. These are the importances of the left interacting regions.

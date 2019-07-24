@@ -43,10 +43,12 @@ GM12878 \  # Name of cell type, used for the database query
 --intn_len 25000  # Size to extend peaks to
 ```
 
-If you would like to train on more data, at the cost of not assessing classification performance, add the `--final` flag.
+If you would like to train on more data, at the cost of not assessing classification performance, add the `--final` flag. This builds a "final" model, and can be used for optimizing fine-mapping performance.
+
+X-SCNN includes code specifically designed to handle large genomic data. The difficulty is that when many ChIP-seq datasets are available (say, 10s to 100s), accessing random positions in the genome becomes very difficult for un-indexed files. Instead of having to read in these individual files, we have built code to generate a database, called `chip_db`. It is built on top of HDF5, and implemented in Python. In order to build this database, you will need bedgraph wig files containing the ChIP-seq and DNase data. It builds a rather large file containing a binarized and indexed representation of this data, which can then be used alone using the API or with X-SCNN to access all available data at any position in constant time, greatly speeding up computation overall. More information is available at https://github.com/ernstlab/chip_db.
 
 #### Chromatin interaction peak file
-This should be a text file with six columns with no header of the form: 
+This should be a tab-delimited text file with six columns and no header of the form: 
 chromosome_A, start_A, end_A, chromosome_B, start_B, end_B
 
 For example:
@@ -63,7 +65,7 @@ chr1    2350000 2375000 chr1    3325000 3350000
 
 #### Numpy matrix method
 
-Create two numpy matrices of size `(num_interactions, 2, num_tracks, length)`. The first represents positive interactions, the second is negative interactions. You do not need the same number of interactions in each. The `2` has to do with the two sides of the interaction, the first index being the left side of the interaction, the second being the right. X-SCNN will automatically reverse the data as well to increase the size of the training data. 
+Create two numpy matrices of size `(num_interactions, 2, num_tracks, length)`. The first represents positive interactions, the second is negative interactions. You do not need the same number of interactions in each. The `2` has to do with the two sides of the interaction, the first index being the left side of the interaction, the second being the right. X-SCNN will automatically reverse the data as well to increase the size of the training data. We have included generated files for both K562 and GM12878, and are available for download in Google Drive at https://drive.google.com/drive/folders/1SlQHF6SSc-lp-jT7yjeriM7eAjX8NHPb?usp=sharing.
 
 ## Fine-mapping
 
@@ -74,3 +76,10 @@ python3 fine_map.py \
 --model final_model.hdf5 \
 --data GM12878:all:log:100bp.npy
 ```
+
+This outputs four files:
+1. A binary gradient file `gradients.npy` of the same shape as the input data `(num_interactions, 2, num_tracks, length)`
+2. A binary importances file `importances.npy` of size `(num_interactions, 2, length)`
+3. A tab-delimited importance file `importances.left.txt` with `num interactions` rows and `length` columns. These are the importances of the left interacting regions.
+4. A tab-delimited importance file `importances.right.txt` with `num interactions` rows and `length` columns. These are the importances of the right interacting regions.
+5. A tab-delimited file of the fine-mapped positions `fine-mapping.txt` for each interacting region. These are the positions with the highest importance scores and X-SCNN fine-mapped positions. These are in genomic coordinates.

@@ -1,6 +1,8 @@
 # Running X-CNN
 
-X-CNN (X here is the lowercase Greek letter 'chi') is a method for computationally fine-mapping chromatin interactions, e.g., Hi-C, using ChIP-seq and/or DNase data. The published manuscript can be accessed here: https://doi.org/10.1093/bioinformatics/btz843. Citation: Artur Jaroszewicz, Jason Ernst, An integrative approach for fine-mapping chromatin interactions, Bioinformatics, , btz843, https://doi.org/10.1093/bioinformatics/btz843
+X-CNN (X here is the lowercase Greek letter 'chi') is a method for computationally fine-mapping chromatin interactions, e.g., Hi-C, using ChIP-seq and/or DNase data. The published manuscript can be accessed here: https://doi.org/10.1093/bioinformatics/btz843. 
+
+Citation: Artur Jaroszewicz, Jason Ernst, An integrative approach for fine-mapping chromatin interactions, Bioinformatics, , btz843, https://doi.org/10.1093/bioinformatics/btz843
 
 X-CNN requires Python 3 and several easy-to-install packages, including numpy, h5py, pandas, keras, and Integrated Gradients (included in repo). I have written a small database package called chip_db to handle the potentially large amounts of data, though it is not necessary to use if you're handy with Python. Since X-CNN needs to randomly access different parts of the genome and extract potentially on the order of 100 ChIP seq tracks, it can be quite cumbersome to keep all these tracks in memory. Chip_db overcomes this challenge by building a database using an hdf5 backend, allowing random access of regions of the genome. It's easy to use and somewhat flexible in how you handle your data. 
 
